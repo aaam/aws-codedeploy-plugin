@@ -1,12 +1,12 @@
 /*
  * Copyright 2014 Amazon.com, Inc. or its affiliates. All Rights Reserved.
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License").
  * You may not use this file except in compliance with the License.
  * A copy of the License is located at
- * 
+ *
  *  http://aws.amazon.com/apache2.0
- * 
+ *
  * or in the "license" file accompanying this file. This file is distributed
  * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
  * express or implied. See the License for the specific language governing
@@ -34,6 +34,7 @@ import com.amazonaws.services.codedeploy.model.S3Location;
 import hudson.FilePath;
 import hudson.Launcher;
 import hudson.Extension;
+import hudson.Util;
 import hudson.model.AbstractBuild;
 import hudson.model.BuildListener;
 import hudson.model.AbstractProject;
@@ -49,6 +50,7 @@ import net.sf.json.JSONException;
 import net.sf.json.JSONObject;
 
 import org.apache.commons.lang.StringUtils;
+import org.apache.commons.io.FileUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
@@ -58,6 +60,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.util.Date;
+import java.util.Map;
 import java.util.UUID;
 
 import javax.servlet.ServletException;
@@ -71,12 +74,10 @@ import javax.servlet.ServletException;
  * credentials to be configured for each project.
  */
 public class AWSCodeDeployPublisher extends Publisher {
-    public static final String    POLLING_TIMEOUT_KEY               = "pollingTimeoutSec";
-    public static final String    POLLING_FREQ_KEY                  = "pollingFreqSec";
     public static final long      DEFAULT_TIMEOUT_SECONDS           = 900;
     public static final long      DEFAULT_POLLING_FREQUENCY_SECONDS = 15;
     public static final String    ROLE_SESSION_NAME                 = "jenkins-codedeploy-plugin";
-    public static final Regions[] AVAILABLE_REGIONS                 = {Regions.US_EAST_1, Regions.US_WEST_2};
+    public static final Regions[] AVAILABLE_REGIONS                 = {Regions.AP_NORTHEAST_1, Regions.AP_SOUTHEAST_1, Regions.AP_SOUTHEAST_2, Regions.EU_WEST_1, Regions.US_EAST_1, Regions.US_WEST_2, Regions.EU_CENTRAL_1};
 
     private final String  s3bucket;
     private final String  s3prefix;
@@ -85,12 +86,14 @@ public class AWSCodeDeployPublisher extends Publisher {
     private final String  deploymentConfig;
     private final Long    pollingTimeoutSec;
     private final Long    pollingFreqSec;
+    private final boolean deploymentGroupAppspec;
     private final boolean waitForCompletion;
     private final String  externalId;
     private final String  iamRoleArn;
     private final String region;
     private final String includes;
     private final String excludes;
+    private final String subdirectory;
     private final String proxyHost;
     private final int proxyPort;
 
@@ -99,7 +102,7 @@ public class AWSCodeDeployPublisher extends Publisher {
     private final String credentials;
 
     private PrintStream logger;
-
+    private Map <String, String> envVars;
     // Fields in config.jelly must match the parameter names in the "DataBoundConstructor"
     @DataBoundConstructor
     public AWSCodeDeployPublisher(
@@ -109,7 +112,10 @@ public class AWSCodeDeployPublisher extends Publisher {
             String deploymentGroupName,
             String deploymentConfig,
             String region,
-            JSONObject waitForCompletion,
+            Boolean deploymentGroupAppspec,
+            Boolean waitForCompletion,
+            Long pollingTimeoutSec,
+            Long pollingFreqSec,
             String credentials,
             String awsAccessKey,
             String awsSecretKey,
@@ -118,35 +124,40 @@ public class AWSCodeDeployPublisher extends Publisher {
             String includes,
             String proxyHost,
             int proxyPort,
-            String excludes) {
+            String excludes,
+            String subdirectory) {
 
         this.externalId = externalId;
         this.applicationName = applicationName;
         this.deploymentGroupName = deploymentGroupName;
-        this.deploymentConfig = deploymentConfig;
+        if (deploymentConfig != null && deploymentConfig.length() == 0) {
+            this.deploymentConfig = null;
+        } else {
+            this.deploymentConfig = deploymentConfig;
+        }
         this.region = region;
         this.includes = includes;
         this.excludes = excludes;
+        this.subdirectory = subdirectory;
         this.proxyHost = proxyHost;
         this.proxyPort = proxyPort;
         this.credentials = credentials;
         this.awsAccessKey = awsAccessKey;
         this.awsSecretKey = awsSecretKey;
         this.iamRoleArn = iamRoleArn;
+        this.deploymentGroupAppspec = deploymentGroupAppspec;
 
-        if (waitForCompletion != null) {
-            this.waitForCompletion = true;
-
-            if (waitForCompletion.containsKey(POLLING_TIMEOUT_KEY)) {
-                this.pollingTimeoutSec = waitForCompletion.getLong(POLLING_TIMEOUT_KEY);
-            } else {
+        if (waitForCompletion != null && waitForCompletion) {
+            this.waitForCompletion = waitForCompletion;
+            if (pollingTimeoutSec == null) {
                 this.pollingTimeoutSec = DEFAULT_TIMEOUT_SECONDS;
-            }
-
-            if (waitForCompletion.containsKey(POLLING_FREQ_KEY)) {
-                this.pollingFreqSec = waitForCompletion.getLong(POLLING_FREQ_KEY);
             } else {
+                this.pollingTimeoutSec = pollingTimeoutSec;
+            }
+            if (pollingFreqSec == null) {
                 this.pollingFreqSec = DEFAULT_POLLING_FREQUENCY_SECONDS;
+            } else {
+                this.pollingFreqSec = pollingFreqSec;
             }
         } else {
             this.waitForCompletion = false;
@@ -161,13 +172,12 @@ public class AWSCodeDeployPublisher extends Publisher {
         } else {
             this.s3prefix = s3prefix;
         }
-
     }
 
     @Override
-    public boolean perform(AbstractBuild build, Launcher launcher, BuildListener listener) {
-
+    public boolean perform(AbstractBuild build, Launcher launcher, BuildListener listener) throws IOException, InterruptedException {
         this.logger = listener.getLogger();
+        envVars = build.getEnvironment(listener);
         final boolean buildFailed = build.getResult() == Result.FAILURE;
         if (buildFailed) {
             logger.println("Skipping CodeDeploy publisher as build failed");
@@ -178,8 +188,8 @@ public class AWSCodeDeployPublisher extends Publisher {
         if ("awsAccessKey".equals(credentials)) {
             if (StringUtils.isEmpty(this.awsAccessKey) && StringUtils.isEmpty(this.awsSecretKey)) {
                 aws = AWSClients.fromDefaultCredentialChain(
-                        this.region, 
-                        this.proxyHost, 
+                        this.region,
+                        this.proxyHost,
                         this.proxyPort);
             } else {
                 aws = AWSClients.fromBasicCredentials(
@@ -205,7 +215,7 @@ public class AWSCodeDeployPublisher extends Publisher {
             verifyCodeDeployApplication(aws);
 
             String projectName = build.getProject().getName();
-            RevisionLocation revisionLocation = zipAndUpload(aws, projectName, build.getWorkspace());
+            RevisionLocation revisionLocation = zipAndUpload(aws, projectName, getSourceDirectory(build.getWorkspace()));
 
             registerRevision(aws, revisionLocation);
             String deploymentId = createDeployment(aws, revisionLocation);
@@ -224,71 +234,126 @@ public class AWSCodeDeployPublisher extends Publisher {
         return success;
     }
 
+    private FilePath getSourceDirectory(FilePath basePath) throws IOException, InterruptedException {
+        String subdirectory = StringUtils.trimToEmpty(this.subdirectory);
+        if (!subdirectory.isEmpty() && !subdirectory.startsWith("/")) {
+            subdirectory = "/" + subdirectory;
+        }
+        FilePath sourcePath = basePath.withSuffix(subdirectory).absolutize();
+        if (!sourcePath.isDirectory() || !isSubDirectory(basePath, sourcePath)) {
+            throw new IllegalArgumentException("Provided path (resolved as '" + sourcePath
+                    +"') is not a subdirectory of the workspace (resolved as '" + basePath + "')");
+        }
+        return sourcePath;
+    }
+
+    private boolean isSubDirectory(FilePath parent, FilePath child) {
+        FilePath parentFolder = child;
+        while (parentFolder!=null) {
+            if (parent.equals(parentFolder)) {
+                return true;
+            }
+            parentFolder = parentFolder.getParent();
+        }
+        return false;
+    }
+
     private void verifyCodeDeployApplication(AWSClients aws) throws IllegalArgumentException {
         // Check that the application exists
         ListApplicationsResult applications = aws.codedeploy.listApplications();
-
-        if (!applications.getApplications().contains(this.applicationName)) {
-            throw new IllegalArgumentException("Cannot find application named '" + this.applicationName + "'");
+        String applicationName = getApplicationNameFromEnv();
+        String deploymentGroupName = getDeploymentGroupNameFromEnv();
+ 
+        if (!applications.getApplications().contains(applicationName)) {
+            throw new IllegalArgumentException("Cannot find application named '" + applicationName + "'");
         }
 
         // Check that the deployment group exists
         ListDeploymentGroupsResult deploymentGroups = aws.codedeploy.listDeploymentGroups(
                 new ListDeploymentGroupsRequest()
-                        .withApplicationName(this.applicationName)
+                        .withApplicationName(applicationName)
         );
 
-        if (!deploymentGroups.getDeploymentGroups().contains(this.deploymentGroupName)) {
-            throw new IllegalArgumentException("Cannot find deployment group named '" + this.deploymentGroupName + "'");
+        if (!deploymentGroups.getDeploymentGroups().contains(deploymentGroupName)) {
+            throw new IllegalArgumentException("Cannot find deployment group named '" + deploymentGroupName + "'");
         }
     }
 
-    private RevisionLocation zipAndUpload(AWSClients aws, String projectName, FilePath workspace) throws IOException,  InterruptedException {
+    private RevisionLocation zipAndUpload(AWSClients aws, String projectName, FilePath sourceDirectory) throws IOException, InterruptedException, IllegalArgumentException {
 
         File zipFile = File.createTempFile(projectName + "-", ".zip");
-        this.logger.println("Zipping workspace into " + zipFile.getAbsolutePath());
-
-        workspace.zip(
-                new FileOutputStream(zipFile),
-                new DirScanner.Glob(this.includes, this.excludes)
-        );
-
         String key;
-        if (this.s3prefix.isEmpty()) {
-            key = zipFile.getName();
-        } else {
-            key = this.s3prefix;
-            if (this.s3prefix.endsWith("/")) {
-                key += zipFile.getName();
-            } else {
-                key += "/" + zipFile.getName();
-            }
+        File appspec;
+        File dest;
+        String deploymentGroupName = getDeploymentGroupNameFromEnv();
+        String prefix = getS3PrefixFromEnv();
+        String bucket = getS3BucketFromEnv();
+
+        if(bucket.indexOf("/") > 0){
+            throw new IllegalArgumentException("S3 Bucket field cannot contain any subdirectories.  Bucket name only!");
         }
 
-        logger.println("Uploading zip to s3://" + this.s3bucket + "/" + key);
-        PutObjectResult s3result = aws.s3.putObject(this.s3bucket, key, zipFile);
+        try {
+            if (this.deploymentGroupAppspec) {
+                appspec = new File(sourceDirectory + "/appspec." + deploymentGroupName + ".yml");
+                if (appspec.exists()) {
+                    dest = new File(sourceDirectory + "/appspec.yml");
+                    FileUtils.copyFile(appspec, dest);
+                    logger.println("Use appspec." + deploymentGroupName + ".yml");
+                }
+                if (!appspec.exists()) {
+                    throw new IllegalArgumentException("/appspec." + deploymentGroupName + ".yml file does not exist" );
+                }
+
+            }
+
+            logger.println("Zipping files into " + zipFile.getAbsolutePath());
 
 
-        S3Location s3Location = new S3Location();
-        s3Location.setBucket(this.s3bucket);
-        s3Location.setKey(key);
-        s3Location.setBundleType(BundleType.Zip);
-        s3Location.setETag(s3result.getETag());
 
-        RevisionLocation revisionLocation = new RevisionLocation();
-        revisionLocation.setRevisionType(RevisionLocationType.S3);
-        revisionLocation.setS3Location(s3Location);
+            sourceDirectory.zip(
+                    new FileOutputStream(zipFile),
+                    new DirScanner.Glob(this.includes, this.excludes)
+            );
 
-        return revisionLocation;
+            if (prefix.isEmpty()) {
+                key = zipFile.getName();
+            } else {
+                key = Util.replaceMacro(prefix, envVars);
+                if (prefix.endsWith("/")) {
+                    key += zipFile.getName();
+                } else {
+                    key += "/" + zipFile.getName();
+                }
+            }
+            logger.println("Uploading zip to s3://" + bucket + "/" + key);
+            PutObjectResult s3result = aws.s3.putObject(bucket, key, zipFile);
+
+
+            S3Location s3Location = new S3Location();
+            s3Location.setBucket(bucket);
+            s3Location.setKey(key);
+            s3Location.setBundleType(BundleType.Zip);
+            s3Location.setETag(s3result.getETag());
+
+            RevisionLocation revisionLocation = new RevisionLocation();
+            revisionLocation.setRevisionType(RevisionLocationType.S3);
+            revisionLocation.setS3Location(s3Location);
+
+            return revisionLocation;
+        } finally {
+            zipFile.delete();
+        }
     }
 
     private void registerRevision(AWSClients aws, RevisionLocation revisionLocation) {
 
-        this.logger.println("Registering revision for application '" + this.applicationName + "'");
+        String applicationName = getApplicationNameFromEnv();
+        this.logger.println("Registering revision for application '" + applicationName + "'");
 
         aws.codedeploy.registerApplicationRevision(
                 new RegisterApplicationRevisionRequest()
-                        .withApplicationName(this.applicationName)
+                        .withApplicationName(applicationName)
                         .withRevision(revisionLocation)
                         .withDescription("Application revision registered via Jenkins")
         );
@@ -300,9 +365,9 @@ public class AWSCodeDeployPublisher extends Publisher {
 
         CreateDeploymentResult createDeploymentResult = aws.codedeploy.createDeployment(
                 new CreateDeploymentRequest()
-                        .withDeploymentConfigName(this.deploymentConfig)
-                        .withDeploymentGroupName(this.deploymentGroupName)
-                        .withApplicationName(this.applicationName)
+                        .withDeploymentConfigName(getDeploymentConfigFromEnv())
+                        .withDeploymentGroupName(getDeploymentGroupNameFromEnv())
+                        .withApplicationName(getApplicationNameFromEnv())
                         .withRevision(revisionLocation)
                         .withDescription("Deployment created by Jenkins")
         );
@@ -353,7 +418,9 @@ public class AWSCodeDeployPublisher extends Publisher {
 
             Thread.sleep(pollingFreqMillis);
         }
-
+        
+        logger.println("Deployment status: " + deployStatus.getStatus() + "; instances: " + deployStatus.getDeploymentOverview());
+        
         if (!deployStatus.getStatus().equals(DeploymentStatus.Succeeded.toString())) {
             this.logger.println("Deployment did not succeed. Final status: " + deployStatus.getStatus());
             success = false;
@@ -413,7 +480,7 @@ public class AWSCodeDeployPublisher extends Publisher {
         }
 
         public boolean isApplicable(Class<? extends AbstractProject> aClass) {
-            // Indicates that this builder can be used with all kinds of project types 
+            // Indicates that this builder can be used with all kinds of project types
             return true;
         }
 
@@ -531,6 +598,10 @@ public class AWSCodeDeployPublisher extends Publisher {
         return deploymentGroupName;
     }
 
+    public String getDeploymentConfig() {
+        return deploymentConfig;
+    }
+
     public String getS3bucket() {
         return s3bucket;
     }
@@ -559,16 +630,16 @@ public class AWSCodeDeployPublisher extends Publisher {
         return pollingFreqSec;
     }
 
-    public String getDeploymentConfig() {
-        return deploymentConfig;
-    }
-
     public String getExternalId() {
         return externalId;
     }
 
     public boolean getWaitForCompletion() {
         return waitForCompletion;
+    }
+
+    public boolean getDeploymentGroupAppspec() {
+        return deploymentGroupAppspec;
     }
 
     public String getCredentials() {
@@ -583,6 +654,10 @@ public class AWSCodeDeployPublisher extends Publisher {
         return excludes;
     }
 
+    public String getSubdirectory() {
+        return subdirectory;
+    }
+
     public String getRegion() {
         return region;
     }
@@ -595,5 +670,24 @@ public class AWSCodeDeployPublisher extends Publisher {
         return proxyPort;
     }
 
+    public String getApplicationNameFromEnv() {
+        return Util.replaceMacro(this.applicationName, envVars);
+    }
+
+    public String getDeploymentGroupNameFromEnv() {
+        return Util.replaceMacro(this.deploymentGroupName, envVars);
+    }
+
+    public String getDeploymentConfigFromEnv() {
+        return Util.replaceMacro(this.deploymentConfig, envVars);
+    }
+
+    public String getS3BucketFromEnv() {
+        return Util.replaceMacro(this.s3bucket, envVars);
+    }
+
+    public String getS3PrefixFromEnv() {
+        return Util.replaceMacro(this.s3prefix, envVars);
+    }
 }
 
